@@ -1,0 +1,36 @@
+import os
+import uuid
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.cors import CORSMiddleware
+
+from .api import router as api_router
+from .crud import game_db
+
+app = FastAPI(title="Boss Fight Dungeon")
+
+# CORS (Cross-Origin Resource Sharing)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex="https?://.*(localhost|run\.app)(:\d+)?|https?://.*\.run\.app",  # Allow localhost and all Cloud Run domains
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"]
+)
+
+app.include_router(api_router, prefix="/api")
+
+# Serve frontend
+STATIC_FILES_DIR = os.environ.get("STATIC_FILES_DIR", "../frontend/build")
+try:
+    app.mount("/", StaticFiles(directory=STATIC_FILES_DIR, html=True), name="static")
+except RuntimeError:
+    print("Frontend build not found. Run `npm run build` in the `frontend` directory.")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    # Clean up mock database on shutdown if needed
+    game_db.clear()
+    print("Server shutting down. Game database cleared.")
+
