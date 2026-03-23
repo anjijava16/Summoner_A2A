@@ -505,12 +505,585 @@ source .venv/bin/activate
 ```
 
 
+---
+
+## Deep Dive: How Every Piece Works Under the Hood
+
+This section walks through the internals of each component — what the code actually does, how data flows between services, what design decisions were made, and why.
+
+---
+
+### ADK Agent Patterns — Why Four Different Architectures?
+
+Each familiar deliberately showcases a different **Google ADK orchestration pattern**. This isn't cosmetic — the project is designed as a learning reference for all four core patterns:
+
+| Pattern | Agent | ADK Class | When to Use |
+|---------|-------|-----------|-------------|
+| **Sequential** | Fire | `SequentialAgent` | Pipeline: output of step N feeds step N+1 |
+| **Parallel + Sequential** | Water | `ParallelAgent` → `SequentialAgent` | Fan-out independent work, then merge results |
+| **Loop** | Earth | `LoopAgent` | Iterative accumulation with a termination condition |
+| **LLM Orchestrator** | Summoner | `LlmAgent` with sub-agents | Dynamic routing — LLM decides which sub-agent to invoke |
+
+#### Fire Familiar — Sequential Pipeline in Detail
+
+```python
+# fire/agent.py — Two LlmAgents chained via SequentialAgent
+root_agent = SequentialAgent(
+    name='fire_elemental_familiar',
+    sub_agents=[scout_agent, amplifier_agent],
+)
+```
+
+**Step 1 — `scout_agent` (Librarian):**
+- Connects to **Cloud SQL via Toolbox** (`ToolboxSyncClient`) — not MCP, but Google's Toolbox SDK
+- Loads the `summoner-librarium` toolset which exposes two SQL queries:
+  - `lookup-available-ability(familiar_name)` → `SELECT ability_name, damage_points FROM abilities WHERE familiar_name = $1`
+  - `ability-damage(ability_name)` → `SELECT damage_points FROM abilities WHERE ability_name = $1`
+- The LLM calls these tools to discover Fire Elemental abilities (e.g., `inferno_lash` at 85 damage, `emberstorm` at 90, `Pyroclasm` at 80)
+- It randomly picks one and retrieves the base damage
+
+**Step 2 — `amplifier_agent`:**
+- Receives the scout's output (base damage number) as context from the previous step
+- Calls `inferno_resonance` via the **general-tools MCP server** over SSE
+- The MCP tool multiplies: `base_fire_damage × 3` → e.g., 85 × 3 = 255
+- The LLM then crafts an epic battle narrative around that final number
+
+**Key insight:** The `SequentialAgent` automatically passes the output of `scout_agent` as input context to `amplifier_agent`. No explicit message passing needed — ADK handles the session state threading.
+
+#### Water Familiar — Parallel Fan-Out + Merge
+
+```python
+# water/agent.py — ParallelAgent feeds into a merger via SequentialAgent
+channel_agent = ParallelAgent(
+    name='channel_agent',
+    sub_agents=[nexus_channeler, forge_channeler],
+)
+
+root_agent = SequentialAgent(
+    name="water_elemental_familiar",
+    sub_agents=[channel_agent, power_merger],
+)
+```
+
+**Fan-out phase (`ParallelAgent`):**
+Two LlmAgents run **simultaneously**:
+1. `nexus_channeler` → calls two MCP tools from the **api-tools-mcp** server:
+   - `cryosea_shatter()` → HTTP POST to Nexus of Whispers API → returns 80 damage
+   - `moonlit_cascade()` → HTTP POST to Nexus of Whispers API → returns 105 damage
+2. `forge_channeler` → calls `leviathan_surge(base_water_damage=20)` from **general-tools-mcp** → 20 × 3 = 60
+
+**Merge phase (`power_merger`):**
+- Receives concatenated outputs from both parallel agents
+- Instructed to extract all damage numbers, sum them (80 + 105 + 60 = 245)
+- Creates an epic combined water/ice attack description
+
+**Key insight:** The `ParallelAgent` truly runs sub-agents concurrently — both MCP tool calls happen at the same time, reducing total latency.
+
+#### Earth Familiar — Loop with Accumulation
+
+```python
+# earth/agent.py — LoopAgent iterates charging_agent → check_agent
+root_agent = LoopAgent(
+    name="earth_elemental_familiar",
+    sub_agents=[charging_agent, check_agent],
+    max_iterations=2,
+    before_agent_callback=check_cool_down  # Cooldown enforced HERE
+)
+```
+
+**Iteration 1:**
+- `charging_agent` calls `seismic_charge(current_energy=1)` → returns energy = 3
+- `check_agent` reports: energy is 3, potential damage = 3 × (80-90) ≈ 240-270
+
+**Iteration 2:**
+- `charging_agent` calls `seismic_charge(current_energy=3)` → returns energy = 5
+- `check_agent` unleashes: energy × multiplier, capped at 300
+
+**Key insight:** Earth is the only agent that uses `before_agent_callback` directly on the root agent (via `check_cool_down` function), while Fire and Water rely on the `CoolDownPlugin` injected at the A2A wrapper level. This shows two different ways to enforce pre-execution logic in ADK.
+
+#### Summoner — LLM as Dynamic Router
+
+```python
+# summoner/agent.py — LlmAgent decides which familiar to invoke
+root_agent = LlmAgent(
+    name="orchestrater_agent",
+    model="gemini-2.5-flash",
+    instruction="... analyze monster weakness → select best familiar ...",
+    sub_agents=[fire_familiar, water_familiar, earth_familiar],
+    after_tool_callback=save_last_summon_after_tool,
+)
+```
+
+**How the routing works:**
+1. The LLM receives a boss description (e.g., "Procrastination looms...")
+2. It matches the weakness keyword to its doctrine:
+   - *Inescapable Reality* → Fire, *Unbroken Collaboration* → Water, *Elegant Sufficiency* → Earth
+3. It checks `state["last_summon"]` to avoid calling the same familiar twice consecutively
+4. It invokes the chosen familiar as a **`RemoteA2aAgent`** → HTTP to a separate Cloud Run service
+
+**The `after_tool_callback` trick:**
+```python
+def save_last_summon_after_tool(tool, args, tool_context, tool_response):
+    tool_context.state["last_summon"] = tool.name  # Persists across conversation turns
+    return tool_response
+```
+This callback fires after every tool/sub-agent execution, recording which familiar was last called so the LLM can enforce diversity.
+
+**Key insight:** The `RemoteA2aAgent` sub-agents fetch their capabilities from `/.well-known/agent.json` at startup. The Summoner doesn't know Fire's internal implementation — it only knows the A2A card's description and capabilities.
+
+---
+
+### The A2A Wrapper — `agent_to_a2a.py` Internals
+
+This is the bridge that turns any ADK agent into a standalone A2A-compatible HTTP service:
+
+```python
+def to_a2a(agent, *, host="0.0.0.0", port=8080, public_url=None) -> Starlette:
+```
+
+**What it creates:**
+
+1. **`Runner`** — ADK's execution engine with in-memory services:
+   - `InMemorySessionService` — conversation history per session
+   - `InMemoryArtifactService` — file/blob storage (unused here)
+   - `InMemoryMemoryService` — long-term memory (unused here)
+   - `InMemoryCredentialService` — auth token storage
+   - **`CoolDownPlugin`** — injected as a plugin with 60-second cooldown
+
+2. **`A2aAgentExecutor`** — Bridges ADK Runner ↔ A2A protocol
+
+3. **`AgentCardBuilder`** — Generates the `/.well-known/agent.json` card containing:
+   - Agent name and description (pulled from the ADK agent definition)
+   - RPC URL (the `public_url` — a Cloud Run URL)
+   - Supported capabilities
+
+4. **`A2AStarletteApplication`** — Mounts routes on a Starlette app:
+   - `GET /.well-known/agent.json` → agent card
+   - `POST /` → JSON-RPC endpoint for task submission
+
+**Startup flow:**
+```
+Starlette app created → "startup" event fires → AgentCardBuilder.build() runs async
+→ A2A routes mounted → Server ready to accept RPC calls
+```
+
+---
+
+### MCP Server Architecture — Two Different Tool Strategies
+
+The project demonstrates two MCP server patterns:
+
+#### Pattern 1: Pure Computation (general-tools-mcp)
+```python
+# mcp-servers/general/main.py
+def inferno_resonance(base_fire_damage: int) -> str:
+    return f"...charged to deal {base_fire_damage * 3} damage."
+
+# Wrapped as ADK FunctionTool, then converted to MCP schema
+inferno_resonanceTool = FunctionTool(inferno_resonance)
+schema = adk_to_mcp_tool_type(inferno_resonanceTool)  # ADK → MCP conversion
+```
+
+Tools are plain Python functions wrapped in `FunctionTool`, then exposed via MCP's low-level `Server` with SSE transport. The `adk_to_mcp_tool_type` conversion utility handles schema translation (parameter types, descriptions → JSON Schema).
+
+#### Pattern 2: External API Proxy (api-tools-mcp)
+```python
+# mcp-servers/api/main.py
+def cryosea_shatter() -> str:
+    response = requests.post(f"{API_SERVER_URL}/cryosea_shatter")
+    data = response.json()
+    return f"...dealing {data.get('damage_points')} damage."
+```
+
+These MCP tools are **proxies** — they make HTTP calls to the Nexus of Whispers API (a FastAPI service on Cloud Run) and wrap the response in a thematic message.
+
+#### Pattern 3: YAML-Defined SQL Tools (db-toolbox)
+```yaml
+# mcp-servers/db-toolbox/tools.yaml
+tools:
+  lookup-available-ability:
+    kind: postgres-sql
+    source: summoner-librarium
+    statement: |
+      SELECT ability_name, damage_points FROM abilities WHERE familiar_name = $1;
+```
+
+Google's Toolbox runtime reads this YAML and auto-generates a REST API that ADK agents consume via `ToolboxSyncClient`. No Python code needed — the tools are pure SQL declarations with typed parameters.
+
+#### SSE Transport Pattern (shared by both MCP servers)
+```python
+app = Server("Arcane-Forge")
+sse = SseServerTransport("/messages/")
+
+starlette_app = Starlette(routes=[
+    Route("/sse", endpoint=handle_sse),          # SSE connection endpoint
+    Mount("/messages/", app=sse.handle_post_message),  # Message posting endpoint
+])
+```
+
+Agents connect to `/sse` to establish a Server-Sent Events stream. Tool calls are sent as POST to `/messages/`. This is MCP's standard SSE transport for remote servers.
+
+---
+
+### The Cooldown System — Two Implementations Compared
+
+The project shows **two different** ways to enforce cooldowns in ADK:
+
+#### Implementation 1: `before_agent_callback` (Earth only)
+```python
+# earth/agent.py — Callback function directly on the agent
+def check_cool_down(callback_context: CallbackContext) -> Optional[types.Content]:
+    response = requests.get(f"{COOLDOWN_API_URL}/cooldown/{agent_name}")
+    # If on cooldown → return Content (terminates agent)
+    # If available → POST new timestamp, return None (proceeds normally)
+
+root_agent = LoopAgent(..., before_agent_callback=check_cool_down)
+```
+
+**Behavior:** The callback fires before the `LoopAgent` starts ANY iteration. If the agent was used within 60 seconds, it returns a `Content` object that completely replaces the agent's output.
+
+#### Implementation 2: `CoolDownPlugin` (Fire, Water via A2A wrapper)
+```python
+# cooldown_plugin.py — ADK Plugin injected into the Runner
+class CoolDownPlugin(BasePlugin):
+    async def before_agent_callback(self, *, agent, callback_context):
+        if not agent_name.endswith("_elemental_familiar"):
+            return None  # Skip sub-agents!
+        # Same cooldown check logic as above...
+```
+
+**Critical difference:** The plugin runs for **every** agent in the tree (root + sub-agents). It has a guard clause: `if not agent_name.endswith("_elemental_familiar")` — this prevents intermediate agents like `scout_agent` or `amplifier_agent` from triggering cooldown checks. Only the root familiar agent is gated.
+
+#### The Nexus of Whispers API (Cooldown Backend)
+```python
+# prerequisite/fake_api/fake_api_server.py
+cooldown_db = {}  # In-memory dict: {"familiar_name": "ISO_timestamp"}
+
+@app.get("/cooldown/{familiar_name}")
+def get_cooldown_status(familiar_name):
+    return {"time": cooldown_db.get(familiar_name)}
+
+@app.post("/cooldown/{familiar_name}")
+def set_cooldown_timestamp(familiar_name, request):
+    cooldown_db[familiar_name] = request.timestamp
+```
+
+Simple in-memory storage. The cooldown state resets when the service restarts. In production, this would be backed by Redis or Firestore.
+
+---
+
+### The Dungeon Backend — How Combat Actually Works
+
+#### Game Initialization Flow
+
+```
+POST /api/miniboss/start
+  │
+  ├─ Validate player_class, get HP from config
+  ├─ create_heroic_action_agent(a2a_endpoint) → InMemoryRunner
+  │     └─ SequentialAgent[RemoteA2aAgent → HeroicScribeAgent]
+  ├─ Create Player model with runner + session_id
+  ├─ If Guardian → asyncio.create_task(trigger_guardian_agent)  ← pre-fight prep call
+  ├─ Build turn_order:
+  │     Shadowblade/Scholar: ["boss", "player_1", "player_1"]  ← 2 attacks per cycle
+  │     Guardian/Summoner:   ["boss", "player_1"]               ← 1 attack per cycle
+  └─ Return GameState JSON
+```
+
+**The Guardian pre-trigger:** When a Guardian is selected, the backend immediately fires a background A2A call ("A monster is coming, be prepared") so the agent's first real response is faster (the LLM context is pre-warmed).
+
+#### Combat Turn Cycle in Detail
+
+```
+GET /api/game/{game_id}  (current_turn == "boss")
+  │
+  ├─ Boss attacks:
+  │   Mini: Single target, 110-140 damage (1/8 chance for half)
+  │   Ultimate: AoE with class-specific damage ranges
+  │     Guardian: 110-170  │  Scholar: 40-80
+  │     Shadowblade: 60-120  │  Summoner: 70-100
+  │
+  ├─ advance_turn() → current_turn = "player_1"
+  │
+  ├─ Call player's A2A agent:
+  │   mock_player_a2a_agent(boss_attack_msg, runner, player_id, session_id, class)
+  │     │
+  │     ├─ If Summoner: await asyncio.sleep(30)  ← deliberate delay for summoner cooldown
+  │     ├─ process_player_action(runner, boss_attack, user_id, session_id)
+  │     │     │
+  │     │     ├─ RemoteA2aAgent → calls player's deployed agent → narrative text
+  │     │     └─ HeroicScribeAgent → parses narrative → {"damage_point": 250, "message": "..."}
+  │     │
+  │     └─ If damage == 0 → fallback damage by class ← handles rate limits gracefully
+  │
+  ├─ mock_damage_quiz_agent() → picks random class quiz + attaches damage value
+  └─ Return GameState with active_quiz
+```
+
+```
+POST /api/game/{game_id}/action  {answer_index: 1}
+  │
+  ├─ Correct answer → full damage to boss
+  ├─ Wrong answer → damage // 2  (integer division = half)
+  ├─ boss.hp = max(0, boss.hp - damage)
+  ├─ check_game_over()
+  ├─ advance_turn()
+  │
+  ├─ If next turn is another player:
+  │     └─ Immediately call their A2A agent + generate quiz
+  ├─ If next turn is boss:
+  │     └─ Return state (frontend polls GET /game/{id} to trigger boss turn)
+  └─ Return GameState
+```
+
+#### The HeroicScribeAgent — LLM-as-Parser
+
+This is one of the cleverest patterns in the project:
+
+```python
+scribe_agent = LlmAgent(
+    model="gemini-2.5-flash",
+    name="HeroicScribeAgent",
+    instruction="""
+        Your final output MUST BE ONLY the raw JSON object:
+        {"damage_point": int, "message": string}
+        Convert words like "ninety" to 90.
+    """,
+)
+```
+
+Instead of writing regex or a custom parser to extract damage numbers from narrative text, the project uses Gemini as a **structured data extractor**. The `RemoteA2aAgent` returns free-text like *"I channel the amplified energy... unleashing a SUPERNOVA for 255 damage!"* and the Scribe converts it to `{"damage_point": 255, "message": "..."}`.
+
+The JSON is cleaned with:
+```python
+cleaned_output = final_output.strip().replace('```json', '').replace('```', '').strip()
+data = json.loads(cleaned_output)
+```
+
+---
+
+### Frontend Combat Engine — Animation & State Machine
+
+#### The Combat Loop State Machine
+
+```
+BOSS_TURN                          PLAYER_TURN
+   │                                  │
+   ├─ setStatusMessage("Waiting...")  ├─ showQuiz = true
+   ├─ wait(4000ms)                    │
+   ├─ pollGameState() ← GET /game/id │
+   ├─ setBossDialog(attack_msg)       │
+   ├─ wait(8000ms) ← dialog display  │
+   ├─ setBossDialog(null)             │
+   ├─ If game_over → GameOverScreen   │
+   └─ showQuiz = true                 │
+                                      │
+       USER ANSWERS QUIZ              │
+              │                       │
+              ├─ showQuiz = false     │
+              ├─ onAction() ← POST   │
+              ├─ setPlayerDialog()    │
+              ├─ wait(3000ms)         │
+              └─ setPlayerDialog(null)│
+```
+
+#### Boss Animation System
+```javascript
+const animationEffects = ['effect-shake', 'effect-pulsate-glow', 'effect-desaturate', 'effect-flip-and-shake'];
+
+// Cycles every 6 seconds during the acting character's turn
+useEffect(() => {
+    intervalId = setInterval(() => {
+        setCurrentEffect(animationEffects[effectIndex]);
+        effectIndex = (effectIndex + 1) % animationEffects.length;
+    }, 6000);
+}, [actingCharacter]);
+```
+
+Four CSS animation effects cycle on the active character's sprite, creating visual feedback while the backend processes A2A calls.
+
+#### Boss Dialogue Cycling
+During the boss turn, a second `useEffect` cycles through the boss's predefined dialogue phrases (stored in `BOSS_DIALOGUES` — 14-15 phrases per boss) every 6 seconds. This keeps the UI alive during the AI processing delay.
+
+#### The Draggable Quiz Modal
+```jsx
+<Draggable nodeRef={nodeRef} handle=".quiz-modal-handle">
+    <div ref={nodeRef} className="quiz-modal-overlay">
+        <div className="quiz-modal-handle">Drag from here</div>
+        // ... quiz content
+    </div>
+</Draggable>
+```
+The quiz uses `react-draggable` so players can move it around the screen to see the boss/player sprites behind it during combat.
+
+---
+
+### Cloud SQL Database Schema — The Librarium
+
+```sql
+CREATE TABLE abilities (
+    id SERIAL PRIMARY KEY,
+    familiar_name VARCHAR(50) NOT NULL,
+    ability_name VARCHAR(50) UNIQUE NOT NULL,
+    damage_points INTEGER NOT NULL,
+    element VARCHAR(20) NOT NULL
+);
+```
+
+Populated with:
+| familiar_name | ability_name | damage_points | element |
+|---------------|-------------|---------------|---------|
+| Fire Elemental | inferno_lash | 85 | Fire |
+| Fire Elemental | emberstorm | 90 | Fire |
+| Fire Elemental | Pyroclasm | 80 | Fire |
+
+Only Fire has DB-stored abilities. Water and Earth use computed values from MCP tools. This is intentional — it demonstrates the difference between **data-backed tools** (SQL queries) and **computation-backed tools** (pure functions, API calls).
+
+---
+
+### Infrastructure Deep Dive
+
+#### Docker Strategy — One Image, Three Services
+
+```dockerfile
+# agent/Dockerfile — same base for all familiars
+FROM python:3.12-slim
+COPY . /app
+CMD ["python", "-m", "earth.agent"]  # Default, overridden per deployment
+```
+
+Cloud Build compiles a single Docker image (`base-familiar:latest`), then deploys it three times with different `--command` overrides:
+```yaml
+# cloudbuild.yaml — parallel deployment
+deploy-fire-familiar:   --args=-m,fire.agent
+deploy-water-familiar:  --args=-m,water.agent
+deploy-earth-familiar:  --args=-m,earth.agent
+```
+
+This is efficient: one build step → three deployments. The `PYTHONPATH=/app` env var ensures all module imports work regardless of which agent is the entrypoint.
+
+#### Multi-Stage Build for the Dungeon UI
+```dockerfile
+# Stage 1: Build React → static files
+FROM node:20-alpine AS builder
+RUN npm run build
+
+# Stage 2: Python backend serves the static files
+FROM python:3.12-slim
+COPY --from=builder /app/frontend/build ./frontend/build
+```
+
+The React app is pre-built and served as static files by FastAPI's `StaticFiles` middleware — no Node.js runtime needed in production.
+
+#### Environment Variable Flow
+
+```
+init.sh → saves PROJECT_ID to ~/project_id.txt
+     ↓
+set_env.sh → reads file → exports:
+  PROJECT_ID, PROJECT_NUMBER, SERVICE_ACCOUNT_NAME
+  REGION (us-central1), DB config, API URLs
+  FIRE_URL, WATER_URL, EARTH_URL (from gcloud run describe)
+     ↓
+prepare.sh → sources set_env.sh → creates Cloud SQL + deploys Nexus API
+     ↓
+data_setup.sh → sources set_env.sh → creates DB/user + populates abilities table
+     ↓
+cloudbuild.yaml → receives vars as _SUBSTITUTIONS → injects as --set-env-vars
+     ↓
+Cloud Run containers → read env vars at runtime (os.environ.get)
+```
+
+---
+
+### Battle Balance Deep Dive
+
+#### Damage Economy Per Class
+
+| Class | Avg Damage/Turn | Turns/Cycle | Effective DPS/Cycle | HP | Survival vs Boss (110-140/hit) |
+|-------|----------------|-------------|---------------------|----|-------------------------------|
+| Summoner | 210-250 | 1 | ~230 | 400 | ~3 boss hits |
+| Shadowblade | 110-160 | 2 | ~270 | 500 | ~4 boss hits |
+| Scholar | 125-150 | 2 | ~275 | 450 | ~3.5 boss hits |
+| Guardian | 120-150 | 1 | ~135 | 950 | ~7.5 boss hits |
+
+**Design philosophy:** Shadowblade and Scholar get **2 consecutive turns** per boss attack, making them feel fast. Guardian gets only 1 turn but can survive far longer. Summoner hits hardest per turn but is a glass cannon.
+
+#### The Rate Limit Fallback
+```python
+if dmg == 0:
+    if player_class == "Summoner":
+        dmg = random.randint(210, 250)
+    elif player_class == "Shadowblade":
+        dmg = random.randint(110, 160)
+```
+
+If the A2A agent returns 0 damage (Gemini rate limit, network error, or parse failure), the backend generates fallback damage appropriate to the class. The game never stalls — it degrades gracefully.
+
+#### The Summoner 30-Second Delay
+```python
+if player_class == "Summoner":
+    await asyncio.sleep(30)
+    msg, dmg = await process_player_action(...)
+```
+
+The Summoner class deliberately waits 30 seconds before calling its agent. This accounts for the cascading A2A calls: Summoner → (selects familiar) → Fire/Water/Earth → MCP tools. The delay ensures the familiar's cooldown has passed if it was recently used.
+
+---
+
+### Quiz System — GCP Knowledge Testing
+
+Each player class has a curated set of **GCP/AI quiz questions**:
+
+| Class | Quiz File | Topics | # Questions |
+|-------|-----------|--------|-------------|
+| Shadowblade | `shadowblade_quizzes.py` | Gemini CLI, MCP protocol, ADK usage | 17 |
+| Scholar | `scholar_quizzes.py` | RAG patterns, BigQuery, pgvector, data pipelines | 20 |
+| Guardian | `guardian_quizzes.py` | Cloud Build, Cloud Run, IAM, infrastructure | 20 |
+| Summoner | `summoner_quizzes.py` | A2A protocol, agent architecture, multi-agent design | 20 |
+
+**Quiz selection is random** — `random.choice(questions)` from the class pool. The quiz carries the damage value from the A2A agent:
+- **Correct answer** → full damage applied to boss
+- **Wrong answer** → `damage // 2` (integer division, always rounds down)
+
+This creates a learning incentive: players who know GCP well deal **2× more effective damage** per turn.
+
+---
+
+### The Diagnose Agent — Hidden Master Agent
+
+There's a standalone diagnostic agent in `mcp-servers/diagnose/agent.py` that isn't used in the game but serves as a testing tool:
+
+```python
+root_agent = LlmAgent(
+    name='master_summoner_agent',
+    instruction="Delegate knowledge queries to librarian_agent, 
+                 and casting/accumulation to arcane_battlemage_agent",
+    sub_agents=[db_agent, mcp_agent],
+)
+```
+
+This agent combines **all** tool sources (DB Toolbox + both MCP servers) under one LLM router. It's useful for verifying that all MCP servers and the database are working before deploying the familiars.
+
+---
+
+### Key Design Decisions & Trade-offs
+
+| Decision | Why | Trade-off |
+|----------|-----|-----------|
+| In-memory game state (`game_db = {}`) | Simplicity, no database dependency for the UI | Games lost on server restart |
+| In-memory cooldown storage | Fast, no external dependency | Cooldowns reset on API restart |
+| `InMemoryRunner` per player | Isolated session per player in a game | Memory grows with concurrent games |
+| Single Docker image for 3 familiars | Build once, deploy thrice — faster CI/CD | Larger image than needed per service |
+| LLM-as-parser (HeroicScribeAgent) | Handles diverse narrative formats without regex | LLM costs per parse, potential hallucination |
+| 30s sleep for Summoner class | Simple fix for cascading cooldowns | Adds latency; could be event-driven |
+| `min-instances=1` on Cloud Run | Eliminates cold starts for agent services | Higher cost even when idle |
+| `GOOGLE_GENAI_USE_VERTEXAI=TRUE` | Routes Gemini calls through Vertex AI (not AI Studio) | Requires GCP project with billing |
+
+---
+
 # Reference docs
 
 https://codelabs.developers.google.com/agentverse-architect/instructions?hl=en#3
 
 ![alt text](image.png)
-
-
-
-
