@@ -507,7 +507,10 @@ source .venv/bin/activate
 
 # Reference docs
 
+https://codelabs.developers.google.com/agentverse-architect/instructions?hl=en#3
+
 ![alt text](image.png)
+
 
 
 
